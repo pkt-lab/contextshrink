@@ -1,0 +1,15 @@
+{
+  "name": "contextshrink",
+  "version": "1.0.0",
+  "description": "LLM token analysis and context compression API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "mcp": "node mcp-server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "js-tiktoken": "^1.0.15"
+  }
+}
