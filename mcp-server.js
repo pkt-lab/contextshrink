@@ -2,11 +2,21 @@
 'use strict';
 // ContextShrink MCP server — stdio JSON-RPC 2.0, MCP spec v2024-11-05
 const { compress, analyzeSegments } = require('./compressor');
-const { countTokens } = require('./tokenizer');
+const { countTokens, countTokensForModel } = require('./tokenizer');
 const readline = require('readline');
 
 const rl = readline.createInterface({ input: process.stdin, output: null, terminal: false });
 function send(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
+
+function getArg(args, key, required = true) {
+  if (!args || typeof args !== 'object') {
+    if (required) throw new Error('Missing arguments object');
+    return undefined;
+  }
+  const val = args[key];
+  if (required && val === undefined) throw new Error(`Missing required argument: ${key}`);
+  return val;
+}
 
 const TOOLS = [
   {
@@ -16,19 +26,19 @@ const TOOLS = [
       type: 'object',
       properties: {
         text: { type: 'string', description: 'Text or prompt to analyze' },
-        model: { type: 'string', description: 'Tokenizer model (default: cl100k_base)', enum: ['cl100k_base', 'p50k_base', 'r50k_base'] }
+        model: { type: 'string', description: 'Model name for tokenization (e.g. gpt-4, claude-3-sonnet, llama-3)' }
       },
       required: ['text']
     }
   },
   {
     name: 'compress_text',
-    description: 'Compress a prompt or document to reduce token count. Returns compressed text with savings report.',
+    description: 'Compress a prompt or document to reduce token count. Returns compressed text with savings report and safety warnings.',
     inputSchema: {
       type: 'object',
       properties: {
         text: { type: 'string', description: 'Text to compress' },
-        strategy: { type: 'string', enum: ['conservative', 'balanced', 'aggressive'], description: 'Compression strategy (default: balanced)' },
+        strategy: { type: 'string', enum: ['safe', 'balanced', 'aggressive'], description: 'Compression strategy (default: balanced). safe=whitespace only, balanced=verbose phrases, aggressive=full' },
         target_ratio: { type: 'number', description: 'Target compression ratio 0-1 (e.g. 0.7 = 30% reduction)' }
       },
       required: ['text']
@@ -36,12 +46,12 @@ const TOOLS = [
   },
   {
     name: 'count_tokens',
-    description: 'Count tokens in a text string for a given model.',
+    description: 'Count tokens in a text string for a given model. Returns count and whether it is exact or estimated.',
     inputSchema: {
       type: 'object',
       properties: {
         text: { type: 'string', description: 'Text to count' },
-        model: { type: 'string', description: 'Model name (optional, used for display only)' }
+        model: { type: 'string', description: 'Model name (e.g. gpt-4, claude-3-sonnet, llama-3)' }
       },
       required: ['text']
     }
@@ -54,10 +64,11 @@ rl.on('line', line => {
   const { id, method, params } = req;
 
   if (method === 'initialize') {
+    const pkg = require('./package.json');
     send({ jsonrpc: '2.0', id, result: {
       protocolVersion: '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: 'contextshrink', version: '1.0.0' }
+      serverInfo: { name: 'contextshrink', version: pkg.version }
     }});
   } else if (method === 'tools/list') {
     send({ jsonrpc: '2.0', id, result: { tools: TOOLS } });
@@ -66,14 +77,28 @@ rl.on('line', line => {
     try {
       let content;
       if (name === 'analyze_tokens') {
-        const r = analyzeSegments(args.text);
-        content = JSON.stringify(r, null, 2);
+        const text = getArg(args, 'text');
+        const model = getArg(args, 'model', false);
+        if (typeof text !== 'string') throw new Error('text must be a string');
+        const r = analyzeSegments(text);
+        const { count, type } = countTokensForModel(text, model);
+        content = JSON.stringify({ ...r, token_count_type: type, model: model || 'default' }, null, 2);
       } else if (name === 'compress_text') {
-        const r = compress(args.text, { strategy: args.strategy, target_ratio: args.target_ratio });
+        const text = getArg(args, 'text');
+        const strategy = getArg(args, 'strategy', false) || 'balanced';
+        const target_ratio = getArg(args, 'target_ratio', false);
+        if (typeof text !== 'string') throw new Error('text must be a string');
+        if (target_ratio !== undefined && (typeof target_ratio !== 'number' || target_ratio <= 0 || target_ratio > 1)) {
+          throw new Error('target_ratio must be a number between 0 (exclusive) and 1 (inclusive)');
+        }
+        const r = compress(text, { strategy, target_ratio });
         content = JSON.stringify(r, null, 2);
       } else if (name === 'count_tokens') {
-        const n = countTokens(args.text);
-        content = JSON.stringify({ tokens: n, model: args.model || 'cl100k_base', text_length: args.text.length });
+        const text = getArg(args, 'text');
+        const model = getArg(args, 'model', false);
+        if (typeof text !== 'string') throw new Error('text must be a string');
+        const { count, type } = countTokensForModel(text, model);
+        content = JSON.stringify({ tokens: count, token_count_type: type, model: model || 'default', text_length: text.length });
       } else {
         throw new Error(`Unknown tool: ${name}`);
       }

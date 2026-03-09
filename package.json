@@ -1,6 +1,6 @@
 {
   "name": "contextshrink",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "LLM token analysis and context compression API",
   "main": "server.js",
   "scripts": {

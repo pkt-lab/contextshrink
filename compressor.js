@@ -1,6 +1,23 @@
 'use strict';
 const { countTokens } = require('./tokenizer');
 
+// --- Protected span handling ---
+const PLACEHOLDER_PREFIX = '\x00NOCOMPRESS';
+function extractProtectedSpans(text) {
+  const spans = [];
+  const result = text.replace(/<no-compress>([\s\S]*?)<\/no-compress>/g, (_, content) => {
+    const id = `${PLACEHOLDER_PREFIX}${spans.length}\x00`;
+    spans.push(content);
+    return id;
+  });
+  return { text: result, spans };
+}
+function restoreProtectedSpans(text, spans) {
+  return text.replace(new RegExp(`${PLACEHOLDER_PREFIX}(\\d+)\x00`, 'g'), (_, i) => {
+    return `<no-compress>${spans[parseInt(i)]}</no-compress>`;
+  });
+}
+
 // Verbose phrase replacements (order matters — longer first)
 const VERBOSE_PHRASES = [
   ['in order to', 'to'],
@@ -47,43 +64,40 @@ const VERBOSE_PHRASES = [
   ['to summarize,', 'in sum,'],
 ];
 
-// Strategies
-function conservativeCompress(text) {
+// --- Compression strategies ---
+
+function safeCompress(text) {
   let t = text;
-  // Normalize whitespace
   t = t.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  t = t.replace(/[ \t]+\n/g, '\n');        // trailing spaces
-  t = t.replace(/\n{3,}/g, '\n\n');        // max 2 blank lines
-  t = t.replace(/[ \t]{2,}/g, ' ');        // multiple spaces
+  t = t.replace(/[ \t]+\n/g, '\n');
+  t = t.replace(/\n{3,}/g, '\n\n');
+  t = t.replace(/[ \t]{2,}/g, ' ');
   return t.trim();
 }
 
+// Alias for backwards compatibility
+const conservativeCompress = safeCompress;
+
 function balancedCompress(text) {
-  let t = conservativeCompress(text);
-  // Apply verbose phrase replacements (case-insensitive)
+  let t = safeCompress(text);
   for (const [from, to] of VERBOSE_PHRASES) {
     const re = new RegExp(from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
     t = t.replace(re, to);
   }
-  // Collapse repeated punctuation
   t = t.replace(/\.{3,}/g, '...');
   t = t.replace(/!{2,}/g, '!');
-  // Remove redundant "please" at start of sentences
   t = t.replace(/\bplease\s+/gi, '');
   return t.trim();
 }
 
 function aggressiveCompress(text) {
   let t = balancedCompress(text);
-  // Remove filler opening phrases
   t = t.replace(/^(sure,?|absolutely,?|of course,?|certainly,?|great,?)\s*/im, '');
-  // Collapse newlines in regular paragraphs (not code blocks)
   const parts = t.split(/(```[\s\S]*?```)/);
   t = parts.map((part, i) => {
-    if (i % 2 === 1) return part; // code block — don't touch
-    return part.replace(/([^\n])\n([^\n])/g, '$1 $2'); // join wrapped lines
+    if (i % 2 === 1) return part; // preserve code blocks
+    return part.replace(/([^\n])\n([^\n])/g, '$1 $2');
   }).join('');
-  // Remove duplicate sentences (simple exact match)
   const sentences = t.match(/[^.!?\n]+[.!?]/g) || [];
   const seen = new Set();
   for (const s of sentences) {
@@ -96,7 +110,6 @@ function aggressiveCompress(text) {
 
 function segmentText(text) {
   const segments = [];
-  // Split into: code blocks, headers, bullets, paragraphs
   const lines = text.split('\n');
   let current = { type: 'paragraph', lines: [] };
 
@@ -136,8 +149,6 @@ function analyzeSegments(text) {
   }));
 
   const suggestions = [];
-
-  // Flag high-token low-info segments
   for (const seg of annotated) {
     if (seg.type === 'paragraph' && seg.tokens > 50) {
       const compressed = balancedCompress(seg.text);
@@ -165,31 +176,50 @@ function analyzeSegments(text) {
 }
 
 function compress(text, { strategy = 'balanced', target_ratio } = {}) {
+  const { text: stripped, spans } = extractProtectedSpans(text);
   const original_tokens = countTokens(text);
+  const safety_warnings = [];
   let compressed;
 
-  if (strategy === 'conservative') compressed = conservativeCompress(text);
-  else if (strategy === 'aggressive') compressed = aggressiveCompress(text);
-  else compressed = balancedCompress(text);
+  const validStrategies = ['safe', 'conservative', 'balanced', 'aggressive'];
+  const strat = validStrategies.includes(strategy) ? strategy : 'balanced';
 
-  // If target_ratio set and we haven't hit it, escalate
+  if (strat === 'safe' || strat === 'conservative') {
+    compressed = safeCompress(stripped);
+  } else if (strat === 'aggressive') {
+    compressed = aggressiveCompress(stripped);
+    safety_warnings.push('duplicate sentence removal applied — verify no intentional repetition was removed');
+    safety_warnings.push('line merging applied — verify line breaks were not semantically significant');
+  } else {
+    compressed = balancedCompress(stripped);
+  }
+
+  // If target_ratio set and not achieved, escalate
   if (target_ratio && target_ratio < 1) {
-    const compressed_tokens = countTokens(compressed);
-    const achieved = compressed_tokens / original_tokens;
-    if (achieved > target_ratio && strategy !== 'aggressive') {
-      compressed = aggressiveCompress(text);
+    const achieved = countTokens(restoreProtectedSpans(compressed, spans)) / original_tokens;
+    if (achieved > target_ratio && strat !== 'aggressive') {
+      compressed = aggressiveCompress(stripped);
+      if (!safety_warnings.length) {
+        safety_warnings.push('escalated to aggressive strategy to meet target_ratio — verify no intentional repetition was removed');
+      }
     }
   }
 
-  const compressed_tokens = countTokens(compressed);
+  const final = restoreProtectedSpans(compressed, spans);
+  const compressed_tokens = countTokens(final);
+
   return {
     original_tokens,
     compressed_tokens,
     ratio: original_tokens > 0 ? Math.round((compressed_tokens / original_tokens) * 100) / 100 : 1,
     savings: original_tokens - compressed_tokens,
-    strategy,
-    compressed_text: compressed,
+    strategy: strat,
+    safety_warnings,
+    compressed_text: final,
   };
 }
 
-module.exports = { compress, analyzeSegments, conservativeCompress, balancedCompress, aggressiveCompress };
+module.exports = {
+  compress, analyzeSegments,
+  safeCompress, conservativeCompress, balancedCompress, aggressiveCompress,
+};
